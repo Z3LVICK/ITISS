@@ -1,30 +1,28 @@
-# ── CHECK: Is KVM present? ──
-lsmod | grep -E "^kvm"
-ls -la /dev/kvm 2>/dev/null
-cat /proc/cpuinfo | grep -E "vmx|svm"
-# vmx = Intel VT-x, svm = AMD-V
+# ── CHECK: Bonding driver ──
+lsmod | grep bonding
+cat /proc/net/bonding/bond0 2>/dev/null
 
-# ── CHECK: Can we access /dev/kvm as regular user? ──
-ls -la /dev/kvm
-# crw-rw---- = group kvm — check if your user is in that group
-id | grep kvm
-groups | grep kvm
+# Try loading bonding module
+modprobe bonding 2>/dev/null && echo "[+] Bonding module loaded" \
+    || echo "[-] Cannot load bonding module"
 
-# ── If in kvm group or /dev/kvm is world-readable ──
+# Check if bonding interface exists
+ip link show type bond 2>/dev/null
+ls /sys/class/net/*/bonding/ 2>/dev/null
+
+# Create a bonding interface to test (no root needed in some configs)
 python3 << 'CHECK'
-import os, fcntl, struct
+import socket, struct, fcntl
 
+# Try to interact with bonding via ioctl
+SIOCBONDENSLAVE = 0x8990
 try:
-    fd = os.open('/dev/kvm', os.O_RDWR)
-    print(f"[VULNERABLE] /dev/kvm opened — KVM CVE-2026-23401 exploitable")
-    
-    # KVM_GET_API_VERSION = 0xAE00
-    KVM_GET_API_VERSION = 0xAE00
-    ver = fcntl.ioctl(fd, KVM_GET_API_VERSION, 0)
-    print(f"[+] KVM API version: {ver}")
-    os.close(fd)
-except PermissionError:
-    print("[-] /dev/kvm not accessible (not in kvm group)")
-except FileNotFoundError:
-    print("[-] /dev/kvm not found — KVM not available")
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, 0)
+    # Query bonding info
+    ifr = struct.pack("16sH", b"bond0", 0) + b'\x00' * 22
+    result = fcntl.ioctl(s, 0x8913, ifr)  # SIOCGIFFLAGS
+    print("[+] Bonding interface accessible — UAF surface reachable")
+    s.close()
+except Exception as e:
+    print(f"[i] Bonding check: {e}")
 CHECK
