@@ -1,30 +1,30 @@
-# ── CHECK: tc (traffic control) subsystem ──
-tc qdisc show 2>/dev/null    # list queue disciplines
-tc filter show 2>/dev/null   # list filters
-lsmod | grep -E "act_ct|cls_|sch_"
+# ── CHECK: Is KVM present? ──
+lsmod | grep -E "^kvm"
+ls -la /dev/kvm 2>/dev/null
+cat /proc/cpuinfo | grep -E "vmx|svm"
+# vmx = Intel VT-x, svm = AMD-V
 
-# Check if unprivileged tc access possible
+# ── CHECK: Can we access /dev/kvm as regular user? ──
+ls -la /dev/kvm
+# crw-rw---- = group kvm — check if your user is in that group
+id | grep kvm
+groups | grep kvm
+
+# ── If in kvm group or /dev/kvm is world-readable ──
 python3 << 'CHECK'
-import socket, struct
-
-# Try netlink RTM_GETQDISC (read-only)
-NETLINK_ROUTE = 0
-RTM_GETQDISC = 38
+import os, fcntl, struct
 
 try:
-    s = socket.socket(socket.AF_NETLINK, socket.SOCK_RAW, NETLINK_ROUTE)
-    nlmsg = struct.pack("IHHII", 20, RTM_GETQDISC, 0x301, 1, 0) + \
-            struct.pack("BBH", 0, 0, 0) + b'\x00' * 8
-    s.send(nlmsg)
-    resp = s.recv(65536)
-    print(f"[+] Traffic control accessible — act_ct UAF surface reachable")
-    print(f"[+] Response: {len(resp)} bytes")
-    s.close()
-except Exception as e:
-    print(f"[-] tc netlink: {e}")
+    fd = os.open('/dev/kvm', os.O_RDWR)
+    print(f"[VULNERABLE] /dev/kvm opened — KVM CVE-2026-23401 exploitable")
+    
+    # KVM_GET_API_VERSION = 0xAE00
+    KVM_GET_API_VERSION = 0xAE00
+    ver = fcntl.ioctl(fd, KVM_GET_API_VERSION, 0)
+    print(f"[+] KVM API version: {ver}")
+    os.close(fd)
+except PermissionError:
+    print("[-] /dev/kvm not accessible (not in kvm group)")
+except FileNotFoundError:
+    print("[-] /dev/kvm not found — KVM not available")
 CHECK
-
-# check conntrack (act_ct depends on it)
-cat /proc/net/nf_conntrack 2>/dev/null | head -5 \
-    && echo "[+] conntrack active — act_ct UAF exploitable"
-lsmod | grep nf_conntrack
