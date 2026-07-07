@@ -1,28 +1,30 @@
-# ── CHECK 1: XFRM subsystem exposure ──
-cat /proc/net/xfrm_stat 2>/dev/null
-# "XfrmInError" counter rising = xfrm actively processing = attack surface
+# ── CHECK: tc (traffic control) subsystem ──
+tc qdisc show 2>/dev/null    # list queue disciplines
+tc filter show 2>/dev/null   # list filters
+lsmod | grep -E "act_ct|cls_|sch_"
 
-# ── CHECK 2: Buffer coalescing path reachable? ──
+# Check if unprivileged tc access possible
 python3 << 'CHECK'
-import socket, struct, os
+import socket, struct
 
-# Check if we can interact with XFRM via netlink
-NETLINK_XFRM = 6
+# Try netlink RTM_GETQDISC (read-only)
+NETLINK_ROUTE = 0
+RTM_GETQDISC = 38
+
 try:
-    s = socket.socket(socket.AF_NETLINK, socket.SOCK_RAW, NETLINK_XFRM)
-    print("[+] XFRM netlink socket created — Fragnesia surface accessible")
-    
-    # Send a basic xfrm query
-    # XFRM_MSG_GETPOLICY = 20
-    nlmsg = struct.pack("IHHII", 16, 20, 0x301, 0, 0)
+    s = socket.socket(socket.AF_NETLINK, socket.SOCK_RAW, NETLINK_ROUTE)
+    nlmsg = struct.pack("IHHII", 20, RTM_GETQDISC, 0x301, 1, 0) + \
+            struct.pack("BBH", 0, 0, 0) + b'\x00' * 8
     s.send(nlmsg)
-    resp = s.recv(4096)
-    print(f"[+] Got XFRM response: {len(resp)} bytes")
+    resp = s.recv(65536)
+    print(f"[+] Traffic control accessible — act_ct UAF surface reachable")
+    print(f"[+] Response: {len(resp)} bytes")
     s.close()
 except Exception as e:
-    print(f"[-] XFRM netlink failed: {e}")
+    print(f"[-] tc netlink: {e}")
 CHECK
 
-# ── DOCUMENT ──
-lsmod | grep -E "xfrm|esp" | tee /dev/shm/finding_Fragnesia.txt
-cat /proc/net/xfrm_stat 2>/dev/null >> /dev/shm/finding_Fragnesia.txt
+# check conntrack (act_ct depends on it)
+cat /proc/net/nf_conntrack 2>/dev/null | head -5 \
+    && echo "[+] conntrack active — act_ct UAF exploitable"
+lsmod | grep nf_conntrack
